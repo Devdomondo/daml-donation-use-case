@@ -1,0 +1,284 @@
+module Donation where
+
+import Daml.Script
+
+-- USER_ENTITY_BEGIN
+-- Represents the connections (who follows who) within the donation community
+template UserEntity with
+    username: Party
+    following: [ Party ]
+  where
+    signatory username
+    observer following
+
+    key username: Party -- each key expression must come with a maintainer expression
+    maintainer key -- takes one or several parties, all of which have to be signatories of the contract and be part of the key
+
+    choice Follow: ContractId UserEntity 
+      with userToFollow: Party
+      -- the controller states who can exercise this choice
+      controller username
+      do
+        -- business rules for creating a UserEntity
+        assertMsg "You cannot follow yourself" (userToFollow /= username)
+        assertMsg "You cannot follow the same user twice" (userToFollow `notElem` following)
+        create this with following = userToFollow :: following
+-- USER_ENTITY_END
+
+
+-- DONATION_BEGIN
+-- represents the split of a donation
+data SplitDonation = SplitDonation with
+  partA : ContractId Donation
+  partB : ContractId Donation
+    deriving (Eq, Show)
+
+-- represents a donation in money
+data Cash = Cash with
+  currency : Text
+  amount : Decimal
+    deriving (Eq, Show)
+
+-- represents a donation (in cash)
+template Donation
+  with
+    issuer : Party
+    owner : Party
+    cash : Cash
+  where
+  signatory issuer
+  observer owner
+  ensure cash.amount > 0.0
+
+  -- A party can transfer a Donation to a new owner
+  -- This choice can be executed by the owner only
+  choice ProposeTransfer : ContractId TransferProposal
+    with 
+      newOwner : Party
+      issuerCid : ContractId UserEntity
+    controller owner
+    do
+      -- business rules
+      assertMsg "You cannot propose a transfer of a donation to yourserlf" (owner /= newOwner)
+      rec <- fetch issuerCid
+      assertMsg "Recipient should be in your following list" (newOwner `elem` rec.following)
+      create TransferProposal with
+        donation = this
+        newOwner
+
+  -- break a donation in 2 parts
+  -- only executed by the owner
+  choice Split : SplitDonation
+    with
+      splitQuantity : Decimal
+    controller owner
+    do
+      partA <- create this with cash.amount = splitQuantity
+      partB <- create this with cash.amount = cash.amount - splitQuantity      
+      return SplitDonation with 
+        partA
+        partB
+
+-- represents a proposal to transfer a donation to another Party
+-- a proposal can be Accepted, Rejected or Cancelled
+template TransferProposal
+  with
+    donation : Donation
+    newOwner : Party
+  where
+    signatory donation.issuer 
+    observer (observer donation), newOwner
+
+    choice AcceptProposal : ContractId Donation
+      controller newOwner -- only the original owner can cancel the proposal
+      do
+        create donation with owner = newOwner
+    
+    choice CancelProposal : ContractId Donation
+      controller donation.owner -- only the original owner can cancel the proposal
+      do
+        create donation
+  
+    choice RejectProposal : ContractId Donation
+      controller newOwner -- only the new owner can reject the proposal
+      do
+        create donation
+
+
+-- Script to test the flow
+user_creation_test : Script ()
+user_creation_test = script do
+
+-------- USER_ENTITY_CREATION BEGIN --------
+
+  -- create Alice party (Donor)
+  alice <- allocateParty "Alice"
+  -- create Donor userEntity
+  donorCid1 <- submit alice do 
+    createCmd UserEntity with username = alice, following = []
+  
+  -- create Unicef party (Ngo)
+  unicef <- allocateParty "Unicef"
+  -- create Ngo userEntity
+  ngoCid1 <- submit unicef do
+    createCmd UserEntity with username = unicef, following = []
+
+  -- create bob party (Beneficiary-B)
+  bob <- allocateParty "Beneficiary-B"
+  -- create Beneficiary-B userEntity
+  beneBCid <- submit bob do 
+    createCmd UserEntity with username = bob, following = []
+
+  -- create charly party (Beneficiary-C)
+  charly <- allocateParty "Beneficiary-C"
+  -- create Beneficiary-C userEntity
+  beneCCid <- submit charly do 
+    createCmd UserEntity with username = charly, following = []
+-------- USER_ENTITY_CREATION BEGIN --------
+
+
+-------- FOLLOWING BEGIN --------
+
+  -- Alice (Donor) follows Unicef (Ngo)
+  donorCid2 <- submit alice do
+    exerciseCmd donorCid1 Follow with userToFollow = unicef
+
+  -- Unicef (Ngo) follows Alice (Donor)
+  ngoCid2 <- submit unicef do
+   exerciseCmd ngoCid1 Follow with userToFollow = alice
+
+  -- Unicef (Ngo) follows Bob (Beneficiary-B)
+  ngoCid3 <- submit unicef do
+    exerciseCmd ngoCid2 Follow with userToFollow = bob
+
+  -- Beneficiary-B follows Ngo
+  -- submit bob do
+  --   exerciseCmd beneId Follow with userToFollow = unicef
+
+-------- FOLLOWING END --------
+
+
+-------- DONATION BEGIN --------
+
+-- Donor creates a donation
+  donationCid1 <- submit alice do 
+    createCmd Donation 
+      with
+        issuer = alice
+        owner = alice
+        cash = Cash with 
+          currency = "EUR"
+          amount = 100.0
+
+-- Donor creates a donation
+  donationCid12 <- submit alice do 
+    createCmd Donation 
+      with
+        issuer = alice
+        owner = alice
+        cash = Cash with 
+          currency = "CHF"
+          amount = 200.0
+
+-- Ngo cannot impersonate the Donor for creating a donation to themselves
+  submitMustFail unicef do
+    createCmd Donation 
+      with
+        issuer = alice
+        owner = unicef
+        cash = Cash with 
+          currency = "EUR"
+          amount = 100.0
+
+-------- DONATION END --------
+
+
+-------- SPLIT_DONATION_BEGIN --------
+
+  -- Donor sends a transfer proposal 1 to the Ngo
+  splitCid1 <- submit alice do
+    exerciseCmd donationCid12 Split
+      with
+        splitQuantity = 50.0
+
+-------- SPLIT_DONATION_BEGIN --------
+
+
+-------- PROPOSE_TRANSER_1_ACCEPT_BEGIN --------
+-- test full positive donation flow: donation (donor) -> donation (ngo) -> donation (Beneficiary-B)
+
+  -- Donor sends a transfer proposal 1 to the Ngo
+  transferProposalCid1 <- submit alice do
+  --submit alice do
+    exerciseCmd donationCid1 ProposeTransfer
+      with
+        newOwner = unicef
+        issuerCid = donorCid2
+
+  -- Ngo accepts the proposal 1
+  donationCid2 <- submit unicef do
+    exerciseCmd transferProposalCid1 AcceptProposal
+
+  -- Ngo sends a transfer proposal 1 to the Beneficiary-B
+  transferProposalCid2 <- submit unicef do
+    exerciseCmd donationCid2 ProposeTransfer
+      with
+        newOwner = bob
+        issuerCid = ngoCid3
+
+  -- Beneficiary-B accepts the proposal 1
+  submit bob do
+    exerciseCmd transferProposalCid2 AcceptProposal
+
+-------- PROPOSE_TRANSER_1_ACCEPT_END --------
+
+
+-------- PROPOSE_TRANSER_2_REJECT_BEGIN --------
+-- test donation rejection of ngo: donation (donor) -> donation (ngo) -> donation (donor)
+
+  -- Donor sends a transfer proposal 2.PartA to the Ngo
+  transferProposalCid12 <- submit alice do
+    exerciseCmd splitCid1.partA ProposeTransfer
+      with
+        newOwner = unicef
+        issuerCid = donorCid2
+
+  -- Ngo accepts the proposal
+  submit unicef do
+    exerciseCmd transferProposalCid12 RejectProposal
+  
+-------- PROPOSE_TRANSER_2_REJECT_END --------
+
+
+-------- PROPOSE_TRANSER_3_CANCEL_BEGIN --------
+-- test donation cancellation of donor: donation (donor) -> donation (ngo) -> donation (donor)
+
+  -- Donor sends a transfer proposal 2.PartB to the Ngo
+  transferProposalCid13 <- submit alice do
+    exerciseCmd splitCid1.partB ProposeTransfer
+      with
+        newOwner = unicef
+        issuerCid = donorCid2
+
+  -- Ngo should be allowed to cancel the proposal because is not the donation owner.
+  submitMustFail unicef do
+    exerciseCmd transferProposalCid13 CancelProposal
+
+  -- Donor cancels the proposal
+  donationCid3 <- submit alice do
+   exerciseCmd transferProposalCid13 CancelProposal
+  
+-------- PROPOSE_TRANSER_3_CANCEL_END --------
+
+
+-------- PROPOSE_TRANSER_4_FOLLOWING_RULE_BEGIN --------
+-- test donation 'following' rule
+
+  -- Donor sends a transfer proposal to a user that is not in the following list
+  submitMustFail alice do
+    exerciseCmd donationCid3 ProposeTransfer
+      with
+        newOwner = charly
+        issuerCid = donorCid2
+  
+-------- PROPOSE_TRANSER_4_FOLLOWING_RULE_END --------
